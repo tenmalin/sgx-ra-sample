@@ -65,6 +65,10 @@ using namespace std;
 #include "logfile.h"
 #include "quote_size.h"
 
+// for Spring server implementation
+#include <curl/curl.h>
+#include <cjson/cJSON.h>
+
 #define MAX_LEN 80
 
 #ifdef _WIN32
@@ -128,6 +132,125 @@ char verbose= 0;
 #else
 # define ENCLAVE_NAME "Enclave.signed.so"
 #endif
+
+struct CurlResponse {
+  char *data;
+  size_t size;
+};
+
+static size_t ResponseCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+  size_t realsize = size * nmemb;
+  struct CurlResponse *rep = (struct CurlResponse *)userp;
+ 
+  char *ptr = (char*)realloc(rep->data, rep->size + realsize + 1);
+  if(!ptr) {
+    /* out of memory! */ 
+    printf("not enough memory (realloc returned NULL)\n");
+    return 0;
+  }
+ 
+  rep->data = ptr;
+  memcpy(&(rep->data[rep->size]), contents, realsize);
+  rep->size += realsize;
+  rep->data[rep->size] = 0;
+ 
+  return realsize;
+}
+
+static void obtainSessionCookies(CURL *curl, long *ret)
+{
+  CURLcode res;
+  const char* sessionID = "raSessionID";
+  struct curl_slist *cookies;
+  struct curl_slist *nc;
+  int i;
+ 
+  printf("Cookies, curl knows:\n");
+  res = curl_easy_getinfo(curl, CURLINFO_COOKIELIST, &cookies);
+  if(res != CURLE_OK) {
+    fprintf(stderr, "Curl curl_easy_getinfo failed: %s\n",
+            curl_easy_strerror(res));
+    exit(1);
+  }
+  nc = cookies;
+  i = 1;
+  while(nc) {
+  	char* session = strstr(nc->data, sessionID);
+  	if(session != NULL) {
+  		*ret = strtol(session+strlen(sessionID), NULL, 10);
+  		//printf("[%d]: %s\n", i, (char*)(session+strlen(sessionID)));
+  		//printf("%d\n", strlen((char*)(session+strlen(sessionID))));
+  		//printf("raSessionID [%lu]", *ret);
+  	}
+    
+    nc = nc->next;
+    i++;
+  }
+  if(i == 1) {
+    printf("(none)\n");
+  }
+  curl_slist_free_all(cookies);
+}
+
+int sendHTTPRequest(const char* url, const char* postfields, string* payload, int* type, long* session)
+{
+  CURL *curl;
+  CURLcode res;
+  struct CurlResponse chunk;
+
+  chunk.data = (char*)malloc(1);  /* will be grown as needed by realloc above */ 
+  chunk.size = 0;    /* no data at this point */ 
+ 
+  curl_global_init(CURL_GLOBAL_ALL);
+ 
+  curl = curl_easy_init();
+  if(curl) {
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    // json field
+    struct curl_slist *hs=NULL;
+	hs = curl_slist_append(hs, "Content-Type: application/json");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hs);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ResponseCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+    if(*session!=-1L) {
+    	// long: 0 - 9223372036854775807
+    	char cookie_string[40]; // 20+(raSessionID=)
+    	sprintf(cookie_string, "raSessionID=%ld;", *session);
+    	curl_easy_setopt(curl, CURLOPT_COOKIE, cookie_string);
+    }
+
+    res = curl_easy_perform(curl);
+    if(res != CURLE_OK) {
+      	fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+    }else{
+    	// response back
+    	printf("response: %s\n", chunk.data);
+    	/* start cookie engine */ 
+    	if(*session==-1L) 
+    		obtainSessionCookies(curl, session);
+    	cJSON* rep_json = cJSON_Parse(chunk.data);
+		if (rep_json != NULL)
+		{
+				const cJSON* msgtype = cJSON_GetObjectItemCaseSensitive(rep_json, "msgtype");	
+				const cJSON* msgdata = cJSON_GetObjectItemCaseSensitive(rep_json, "msgdata");
+				payload->append(msgdata->valuestring);
+				*type = msgtype->valueint;
+    	}
+    	cJSON_Delete(rep_json);
+    }
+ 
+    curl_easy_cleanup(curl);
+  }else{
+  	res = CURLE_FAILED_INIT;
+  }
+  free(chunk.data);
+  curl_global_cleanup();
+  return res;
+}
+
 
 int main (int argc, char *argv[])
 {
@@ -351,7 +474,7 @@ int main (int argc, char *argv[])
 		}
 		
 		/* If there's a : then we have a port, too */
-		cp= strchr(config.server, ':');
+		cp = strchr(config.server, ':');
 		if ( cp != NULL ) {
 			*cp++= '\0';
 			config.port= cp;
@@ -443,6 +566,19 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 	int enclaveTrusted = NotTrusted; // Not Trusted
 	int b_pse= OPT_ISSET(flags, OPT_PSE);
 
+	char server_url[50];
+	memset( server_url, '\0', sizeof(server_url) );
+	if( strlen(config->server)>15 || strlen(config->port)>5) {
+		fprintf(stderr, "Parameter Server and Port are too long.\n");
+		fprintf(stderr, "config->server: %s\n", config->server);
+		fprintf(stderr, "config->port: %s\n", config->port);
+	}
+	
+	// format: "http://10.153.136.22:8081/attestation"
+	sprintf(server_url, "http://%s:%s/attestation", config->server, config->port);
+
+	// TENMA: we do not use msgio anay more
+	/*
 	if ( config->server == NULL ) {
 		msgio = new MsgIO();
 	} else {
@@ -454,6 +590,7 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 			exit(1);
 		}
 	}
+	*/
 
 	/*
 	 * WARNING! Normally, the public key would be hardcoded into the
@@ -574,9 +711,42 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 	divider(fplog);
 
 	dividerWithText(stderr, "Copy/Paste Msg0||Msg1 Below to SP");
-	msgio->send_partial(&msg0_extended_epid_group_id,
-		sizeof(msg0_extended_epid_group_id));
-	msgio->send(&msg1, sizeof(msg1));
+	
+	//msgio->send_partial(&msg0_extended_epid_group_id,
+	//	sizeof(msg0_extended_epid_group_id));
+	//msgio->send(&msg1, sizeof(msg1));
+	
+	
+	string msg_data;
+	long sessionID = -1L;
+	// new added code
+	msg_data.append(hexstring(&msg0_extended_epid_group_id, sizeof(msg0_extended_epid_group_id)));
+    msg_data.append(hexstring(&msg1, sizeof(msg1)));
+	// construct json
+	string msg2_rep;
+	cJSON *monitor = cJSON_CreateObject();
+	if(monitor==NULL) cJSON_Delete(monitor);
+	else{
+		int type = 0;
+		cJSON_AddItemToObject(monitor, "msgtype", cJSON_CreateNumber(1));
+		cJSON_AddItemToObject(monitor, "msgdata", cJSON_CreateString(msg_data.c_str()));
+		char* msg1_json = cJSON_Print(monitor);
+		printf("msg1_json: %s\n", msg1_json);
+		if((sendHTTPRequest(server_url, msg1_json, &msg2_rep, &type, &sessionID)==CURLE_OK) && (type==2))
+		{
+			printf("raSessionID in cookies: %lu\n", sessionID);
+			msg2 = (sgx_ra_msg2_t*) malloc( sizeof(sgx_ra_msg2_t));
+			if(msg2==NULL) printf("msg2 allocated failed\n");
+			// convert to msg2
+			from_hexstring((unsigned char *)msg2, msg2_rep.c_str(), msg2_rep.length()/2);
+			if(msg2==NULL) printf("msg2 allocated failed\n");
+			rv = 1;
+		}else{
+			rv = 0;
+		}
+	}
+	cJSON_Delete(monitor);
+
 	divider(stderr);
 
 	fprintf(stderr, "Waiting for msg2\n");
@@ -586,8 +756,10 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 	 * msg2 is variable length b/c it includes the revocation list at
 	 * the end. msg2 is malloc'd in readZ_msg do free it when done.
 	 */
-
-	rv= msgio->read((void **) &msg2, NULL);
+	
+	
+	//rv= msgio->read((void **) &msg2, NULL);
+	
 	if ( rv == 0 ) {
 		enclave_ra_close(eid, &sgxrv, ra_ctx);
 		fprintf(stderr, "protocol error reading msg2\n");
@@ -712,7 +884,34 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 	}
 
 	dividerWithText(stderr, "Copy/Paste Msg3 Below to SP");
-	msgio->send(msg3, msg3_sz);
+	
+	//msgio->send(msg3, msg3_sz);
+	
+	msg_data.clear();
+	string msg3_rep;
+	// new added code
+	msg_data.append(hexstring(msg3, msg3_sz));
+	
+	monitor = cJSON_CreateObject();
+	if(monitor==NULL) cJSON_Delete(monitor);
+	else{
+		int type = 0;
+		cJSON_AddItemToObject(monitor, "msgtype", cJSON_CreateNumber(3));
+		cJSON_AddItemToObject(monitor, "msgdata", cJSON_CreateString(msg_data.c_str()));
+		char* msg4_json = cJSON_Print(monitor);
+		printf("msg4_json: %s\n", msg4_json);
+		if((sendHTTPRequest(server_url, msg4_json, &msg3_rep, &type, &sessionID)==CURLE_OK) && (type==4))
+		{
+			msg4 = (ra_msg4_t*) malloc( sizeof(ra_msg4_t));
+			if(msg4==NULL) printf("msg4 allocated failed\n");
+			// convert to msg4
+			from_hexstring((unsigned char *)msg4, msg3_rep.c_str(), msg3_rep.length()/2);
+			rv = 1;
+		}else{
+			rv = 0;
+		}
+	}
+	cJSON_Delete(monitor);
 	divider(stderr);
 
 	dividerWithText(fplog, "Msg3 ==> SP");
@@ -725,8 +924,8 @@ int do_attestation (sgx_enclave_id_t eid, config_t *config)
 	}
  
 	/* Read Msg4 provided by Service Provider, then process */
-        
-	rv= msgio->read((void **)&msg4, &msg4sz);
+	//rv= msgio->read((void **)&msg4, &msg4sz);
+	
 	if ( rv == 0 ) {
 		enclave_ra_close(eid, &sgxrv, ra_ctx);
 		fprintf(stderr, "protocol error reading msg4\n");
