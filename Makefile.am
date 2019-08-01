@@ -117,7 +117,7 @@ mrsigner_LDFLAGS= $(AM_LDFLAGS) @OPENSSL_LDFLAGS@
 ## targets work on simulation builds.
 
 client_LDADD=-l$(SGX_URTS_LIB) -lsgx_ukey_exchange -l$(SGX_UAE_SERVICE_LIB) \
-	-lcrypto -l:libsgx_capable.a -lpthread -ldl -lcurl -lcjson
+	-lcrypto -lssl -l:libsgx_capable.a -lpthread -ldl -lcurl -lcjson
 
 mrsigner_LDADD=-lcrypto
 
